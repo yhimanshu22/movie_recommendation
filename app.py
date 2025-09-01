@@ -13,6 +13,12 @@ import json
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+if not (os.path.exists("movies.pkl") and os.path.exists("similarity.npy")):
+    import preprocess
+    df = preprocess.load_and_process_data()
+    similarity = preprocess.generate_vectors_and_similarity(df)
+    preprocess.save_data(df, similarity)
+
 # Function to load data and similarity matrix
 @st.cache_data
 def load_data():
