@@ -9,6 +9,7 @@ venv/
 ENV/
 env/
 .venv/
+.env
 
 # Data files
 *.zip
