@@ -1,114 +1,128 @@
-import os
-import json
-import pickle
-import requests
+
+# preprocess.py
+# Script to preprocess TMDB 5000 dataset and generate pickle files
+
 import pandas as pd
 import numpy as np
-from pathlib import Path
-from tqdm import tqdm
-from nltk.stem.porter import PorterStemmer
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from nltk.stem.porter import PorterStemmer
+import nltk
+import logging
+import argparse
+import os
+import zipfile
+import subprocess
+import json
 
-# Global Paths
-data_dir = Path("data")
-movies_pkl = Path("movies.pkl")
-similarity_npy = Path("similarity.npy")
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+def download_nltk_data():
+    """Download NLTK punkt dataset if not already present."""
+    try:
+        nltk.data.find('tokenizers/punkt')
+        logger.info("NLTK punkt dataset already downloaded.")
+    except LookupError:
+        logger.info("Downloading NLTK punkt dataset...")
+        try:
+            nltk.download('punkt', quiet=True)
+            logger.info("NLTK punkt dataset downloaded successfully.")
+        except Exception as e:
+            logger.error(f"Error downloading NLTK punkt dataset: {str(e)}")
+            raise
 
 ps = PorterStemmer()
 
+def stem(text):
+    y = [ps.stem(i) for i in text.split()]
+    return " ".join(y)
 
-def safe_json_loads(x, default="[]"):
+def download_data():
+    """Download and extract TMDB 5000 dataset from Kaggle if not present."""
+    if not os.path.exists('data/movies.csv') or not os.path.exists('data/credits.csv'):
+        logger.info("Downloading TMDB 5000 dataset from Kaggle...")
+        try:
+            subprocess.run(["kaggle", "datasets", "download", "-d", "tmdb/tmdb-movie-metadata", "-p", "data/"], check=True)
+            with zipfile.ZipFile('data/tmdb-movie-metadata.zip', 'r') as zip_ref:
+                zip_ref.extractall('data/')
+            # Rename files to match expected paths
+            os.rename('data/tmdb_5000_movies.csv', 'data/movies.csv')
+            os.rename('data/tmdb_5000_credits.csv', 'data/credits.csv')
+            os.remove('data/tmdb-movie-metadata.zip')
+            logger.info("Dataset downloaded and extracted.")
+        except Exception as e:
+            logger.error(f"Error downloading data: {str(e)}")
+            raise
+
+def load_and_process_data(movies_path='data/movies.csv', credits_path='data/credits.csv'):
+    """Load, merge, and process TMDB data to create tags."""
     try:
-        return json.loads(x) if pd.notna(x) else []
-    except Exception:
-        return json.loads(default)
-
-
-def create_tags(row):
-    genres = " ".join([g["name"] for g in safe_json_loads(row["genres"])])
-    keywords = " ".join([k["name"] for k in safe_json_loads(row["keywords"])])
-    cast = " ".join([c["name"].replace(" ", "") for c in safe_json_loads(row["cast"])[:3]])
-    director = next(
-        (c["name"].replace(" ", "") for c in safe_json_loads(row["crew"]) if c["job"] == "Director"),
-        "",
-    )
-    overview = str(row["overview"]) if pd.notna(row["overview"]) else ""
-    return f"{overview} {genres} {keywords} {cast} {director}".strip()
-
-
-def stem(text: str) -> str:
-    return " ".join([ps.stem(word) for word in text.split()])
-
-
-def download_dataset():
-    """
-    Tries to fetch dataset.
-    If Kaggle CLI isn't available (e.g., Streamlit Cloud), fallback to a direct link.
-    """
-    if data_dir.exists():
-        print("✅ Dataset already exists.")
-        return
-
-    try:
-        print("📥 Downloading dataset from Kaggle...")
-        os.system("kaggle datasets download -d tmdb/tmdb-movie-metadata -p ./")
-        os.system("unzip -q tmdb-movie-metadata.zip -d data")
-        os.remove("tmdb-movie-metadata.zip")
-        print("✅ Kaggle dataset downloaded.")
+        movies = pd.read_csv(movies_path)
+        credits = pd.read_csv(credits_path)
+        
+        # Remove duplicates
+        movies.drop_duplicates(subset='id', keep='first', inplace=True)
+        credits.drop_duplicates(subset='movie_id', keep='first', inplace=True)
+        
+        # Merge on movie_id (id in movies.csv, movie_id in credits.csv)
+        df = movies.merge(credits, left_on='id', right_on='movie_id', how='left', suffixes=('', '_credits'))
+        
+        # Create tags
+        def create_tags(row):
+            # Parse JSON-like columns
+            genres = ' '.join([g['name'] for g in json.loads(row['genres'])]) if pd.notna(row['genres']) else ''
+            keywords = ' '.join([k['name'] for k in json.loads(row['keywords'])]) if pd.notna(row['keywords']) else ''
+            cast = ' '.join([c['name'].replace(' ', '') for c in json.loads(row['cast'])[:3]]) if pd.notna(row['cast']) else ''
+            director = next((c['name'].replace(' ', '') for c in json.loads(row['crew']) if c['job'] == 'Director'), '') if pd.notna(row['crew']) else ''
+            overview = str(row['overview']) if pd.notna(row['overview']) else ''
+            return f"{overview} {genres} {keywords} {cast} {director}"
+        
+        df['tags'] = df.apply(create_tags, axis=1)
+        df = df[['id', 'title', 'genres', 'tags']]  # Keep genres for display
+        df['title'] = df['title'].str.strip()  # Clean titles
+        
+        # Preprocess tags
+        df['tags'] = df['tags'].apply(lambda x: x.lower())
+        df['tags'] = df['tags'].apply(stem)
+        
+        logger.info("Data processed successfully.")
+        return df
     except Exception as e:
-        print("⚠️ Kaggle download failed, trying fallback...")
-        # Example fallback: Replace with your own uploaded dataset link
-        url = "https://raw.githubusercontent.com/zygmuntz/goodbooks-10k/master/books.csv"
-        r = requests.get(url)
-        data_dir.mkdir(exist_ok=True)
-        with open(data_dir / "movies.csv", "wb") as f:
-            f.write(r.content)
-        print("✅ Fallback dataset downloaded.")
+        logger.error(f"Error processing data: {str(e)}")
+        raise
 
+def generate_vectors_and_similarity(df):
+    """Vectorize tags and compute similarity."""
+    try:
+        tfidf = TfidfVectorizer(max_features=5000, stop_words='english', ngram_range=(1,2))
+        vectors = tfidf.fit_transform(df['tags']).toarray()
+        similarity = cosine_similarity(vectors)
+        logger.info("Vectors and similarity matrix generated.")
+        return similarity
+    except Exception as e:
+        logger.error(f"Error generating vectors/similarity: {str(e)}")
+        raise
 
-def preprocess():
-    download_dataset()
-
-    # Load CSVs
-    movies = pd.read_csv(data_dir / "movies.csv")
-    credits = pd.read_csv(data_dir / "credits.csv")
-
-    # Merge datasets
-    df = movies.merge(credits, on="id")
-
-    # Select features
-    df = df[["id", "title", "overview", "genres", "keywords", "cast", "crew"]]
-
-    # Drop NaNs
-    df.dropna(inplace=True)
-
-    # Create tags
-    tqdm.pandas(desc="🔄 Creating tags")
-    df["tags"] = df.progress_apply(create_tags, axis=1)
-
-    # Process tags
-    df["tags"] = df["tags"].str.lower().apply(stem)
-
-    # Vectorize
-    print("⚡ Building TF-IDF vectors...")
-    tfidf = TfidfVectorizer(max_features=5000, stop_words="english")
-    vectors = tfidf.fit_transform(df["tags"]).toarray()
-
-    # Cosine similarity
-    from sklearn.metrics.pairwise import cosine_similarity
-
-    similarity = cosine_similarity(vectors)
-
-    # Save
-    with open(movies_pkl, "wb") as f:
-        pickle.dump(df[["id", "title", "tags"]], f)
-
-    np.save(similarity_npy, similarity)
-
-    print("✅ Preprocessing complete. Files saved:")
-    print(f"  - {movies_pkl}")
-    print(f"  - {similarity_npy}")
-
+def save_data(df, similarity):
+    try:
+        df.to_pickle('movies.pkl')
+        np.save('similarity.npy', similarity)
+        logger.info("Data saved to 'movies.pkl' and 'similarity.npy'.")
+    except Exception as e:
+        logger.error(f"Error saving data: {str(e)}")
+        raise
 
 if __name__ == "__main__":
-    preprocess()
+    parser = argparse.ArgumentParser(description="Preprocess TMDB 5000 data for recommender.")
+    parser.add_argument('--download', action='store_true', help="Download dataset if not present")
+    args = parser.parse_args()
+    
+    download_nltk_data()
+    if args.download:
+        download_data()
+    
+    df = load_and_process_data()
+    similarity = generate_vectors_and_similarity(df)
+    save_data(df, similarity)
