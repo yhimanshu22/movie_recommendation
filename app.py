@@ -15,7 +15,6 @@ logger = logging.getLogger(__name__)
 
 if not (os.path.exists("movies.pkl") and os.path.exists("similarity.npy")):
     import preprocess
-    preprocess.download_data() 
     df = preprocess.load_and_process_data()
     similarity = preprocess.generate_vectors_and_similarity(df)
     preprocess.save_data(df, similarity)
